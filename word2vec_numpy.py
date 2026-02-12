@@ -51,6 +51,103 @@ class Parameters:
 	context: np.ndarray  # shape: (V, d)
 
 
+class Word2VecModel:
+	"""Base interface for word2vec variants."""
+
+	def __init__(self, params: Parameters) -> None:
+		self.params = params
+
+	def forward(self, center_idx: int, context_idx: int):
+		raise NotImplementedError
+
+	def backward(self, cache):
+		raise NotImplementedError
+
+
+class SoftmaxModel(Word2VecModel):
+	"""Full softmax word2vec."""
+
+	def forward(self, center_idx: int, context_idx: int):
+		v_c = self.params.center[center_idx]
+		scores = self.params.context @ v_c
+		probs = softmax(scores)
+		loss = -np.log(probs[context_idx])
+		cache = (center_idx, context_idx, v_c, probs)
+		return loss, cache
+
+	def backward(self, cache):
+		center_idx, context_idx, v_c, probs = cache
+		grad_context = probs[:, None] * v_c[None, :]
+		grad_context[context_idx] -= v_c
+		expected_context = probs @ self.params.context
+		grad_v_c = expected_context - self.params.context[context_idx]
+		grad_center = np.zeros_like(self.params.center)
+		grad_center[center_idx] = grad_v_c
+		return grad_center, grad_context
+
+
+class NegSamplingModel(Word2VecModel):
+	"""Negative sampling word2vec."""
+
+	def __init__(
+		self,
+		params: Parameters,
+		K: int,
+		neg_dist: np.ndarray,
+		rng: np.random.Generator,
+	) -> None:
+		super().__init__(params)
+		self.K = K
+		self.neg_dist = neg_dist
+		self.rng = rng
+
+	def forward(self, center_idx: int, context_idx: int):
+		v_c = self.params.center[center_idx]
+		neg_indices = sample_negative_indices(
+			vocab_size=self.params.context.shape[0],
+			dist=self.neg_dist,
+			K=self.K,
+			rng=self.rng,
+			exclude={center_idx, context_idx},
+		)
+
+		pos_score = self.params.context[context_idx] @ v_c
+		pos_sig = sigmoid(pos_score)
+		neg_vectors = self.params.context[neg_indices]
+		neg_scores = neg_vectors @ v_c
+		neg_sig = sigmoid(-neg_scores)
+
+		pos_loss = -np.log(pos_sig + 1e-12)
+		neg_loss = -np.sum(np.log(neg_sig + 1e-12))
+		loss = pos_loss + neg_loss
+
+		cache = (
+			center_idx,
+			context_idx,
+			v_c,
+			pos_sig,
+			neg_scores,
+			neg_indices,
+		)
+		return loss, cache
+
+	def backward(self, cache):
+		center_idx, context_idx, v_c, pos_sig, neg_scores, neg_indices = cache
+		neg_sig_pos = sigmoid(neg_scores)
+
+		grad_center_vec = (pos_sig - 1.0) * self.params.context[context_idx]
+		grad_center_vec += np.sum(neg_sig_pos[:, None] * self.params.context[neg_indices], axis=0)
+
+		grad_center = np.zeros_like(self.params.center)
+		grad_center[center_idx] = grad_center_vec
+
+		grad_context = np.zeros_like(self.params.context)
+		grad_context[context_idx] = (pos_sig - 1.0) * v_c
+		grad_context[neg_indices] += neg_sig_pos[:, None] * v_c[None, :]
+
+		return grad_center, grad_context
+
+
 def init_params(vocab_size: int, dim: int, seed: int = 42) -> Parameters:
 	"""Small random init to break symmetry."""
 	rng = np.random.default_rng(seed)
@@ -124,138 +221,23 @@ def sample_negative_indices(
 	return negatives
 
 
-def forward_softmax(
-	center_idx: int, outside_idx: int, params: Parameters
-) -> Tuple[float, np.ndarray, np.ndarray]:
-	"""
-	Forward pass: compute softmax probs and loss for a (center, context) pair.
-
-	Returns loss, probabilities over vocab, and the center vector snapshot v_c.
-	"""
-
-	v_c = params.center[center_idx]  # v_c
-	scores = params.context @ v_c  # u_w^T v_c for all w
-	probs = softmax(scores)  # P(w|c)
-	loss = -np.log(probs[outside_idx])
-	return loss, probs, v_c
-
-
-def backward_softmax(
-	probs: np.ndarray,
-	center_idx: int,
-	outside_idx: int,
-	params: Parameters,
-	v_c: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-	"""
-	Backward pass: compute gradients given forward outputs.
-
-	Returns grad_center (shape (V, d), only center row nonzero) and
-	grad_context (shape (V, d), dense across vocab).
-	"""
-
-	grad_context = probs[:, None] * v_c[None, :]  # P(w|c) v_c
-	grad_context[outside_idx] -= v_c  # (P(o|c) - 1) v_c at the true word
-
-	expected_context = probs @ params.context  # sum_w P(w|c) u_w
-	grad_v_c = expected_context - params.context[outside_idx]
-
-	grad_center = np.zeros_like(params.center)
-	grad_center[center_idx] = grad_v_c
-	return grad_center, grad_context
-
-
-def naive_softmax_loss_and_grads(
-	center_idx: int, outside_idx: int, params: Parameters
-) -> Tuple[float, np.ndarray, np.ndarray]:
-	"""
-	Compute loss and gradients for one (center, context) pair using full softmax.
-
-	Returns (loss, grad_center, grad_context) where grad_center has shape (V, d)
-	but is zero everywhere except the row for center_idx; grad_context has shape
-	(V, d) and is dense because every u_w participates in the denominator.
-	"""
-
-	loss, probs, v_c = forward_softmax(center_idx, outside_idx, params)
-	grad_center, grad_context = backward_softmax(
-		probs=probs,
-		center_idx=center_idx,
-		outside_idx=outside_idx,
-		params=params,
-		v_c=v_c,
-	)
-	return loss, grad_center, grad_context
-
-
-def neg_sampling_loss_and_grads(
-	center_idx: int,
-	out_idx: int,
-	neg_indices: List[int],
-	params: Parameters,
-) -> Tuple[float, np.ndarray, np.ndarray]:
-	"""Negative sampling loss/gradients for one center/out pair and K negatives."""
-	v_c = params.center[center_idx]
-
-	# Positive term
-	pos_score = params.context[out_idx] @ v_c
-	pos_sig = sigmoid(pos_score)
-	pos_loss = -np.log(pos_sig + 1e-12)
-
-	# Negative terms
-	neg_vectors = params.context[neg_indices]
-	neg_scores = neg_vectors @ v_c
-	neg_sig = sigmoid(-neg_scores)
-	neg_loss = -np.sum(np.log(neg_sig + 1e-12))
-
-	loss = pos_loss + neg_loss
-
-	grad_center_vec = (pos_sig - 1.0) * params.context[out_idx]
-	grad_center_vec += np.sum(sigmoid(neg_scores)[:, None] * neg_vectors, axis=0)
-
-	grad_center = np.zeros_like(params.center)
-	grad_center[center_idx] = grad_center_vec
-
-	grad_context = np.zeros_like(params.context)
-	grad_context[out_idx] = (pos_sig - 1.0) * v_c
-	grad_context[neg_indices] += sigmoid(neg_scores)[:, None] * v_c[None, :]
-
-	return loss, grad_center, grad_context
+"""Model-specific forward/backward live in the model classes below."""
 
 
 def sgd_step(
 	pairs: List[Tuple[int, int]],
-	params: Parameters,
+	model: Word2VecModel,
 	lr: float,
 	log_every: int | None = None,
-	loss_type: str = "softmax",
-	K: int = 5,
-	neg_dist: np.ndarray | None = None,
-	rng: np.random.Generator | None = None,
 ) -> float:
-	"""One SGD sweep with optional negative sampling and progress logging."""
+	"""One SGD sweep using the provided model."""
 	total_loss = 0.0
 	for idx, (center_idx, outside_idx) in enumerate(pairs, start=1):
-		if loss_type == "softmax":
-			loss, grad_center, grad_context = naive_softmax_loss_and_grads(
-				center_idx, outside_idx, params
-			)
-		elif loss_type == "neg":
-			assert neg_dist is not None and rng is not None
-			neg_indices = sample_negative_indices(
-				vocab_size=params.context.shape[0],
-				dist=neg_dist,
-				K=K,
-				rng=rng,
-				exclude={outside_idx, center_idx},
-			)
-			loss, grad_center, grad_context = neg_sampling_loss_and_grads(
-				center_idx, outside_idx, neg_indices, params
-			)
-		else:
-			raise ValueError(f"unknown loss_type {loss_type}")
+		loss, cache = model.forward(center_idx, outside_idx)
+		grad_center, grad_context = model.backward(cache)
 
-		params.center -= lr * grad_center
-		params.context -= lr * grad_context
+		model.params.center -= lr * grad_center
+		model.params.context -= lr * grad_context
 		total_loss += loss
 		if log_every and idx % log_every == 0:
 			avg_loss = total_loss / idx
@@ -298,18 +280,15 @@ if __name__ == "__main__":
 	rng = np.random.default_rng(123)
 	neg_dist = make_unigram_distribution(freqs) if args.loss == "neg" else None
 
+	if args.loss == "softmax":
+		model: Word2VecModel = SoftmaxModel(params)
+	else:
+		assert neg_dist is not None
+		model = NegSamplingModel(params=params, K=args.neg_k, neg_dist=neg_dist, rng=rng)
+
 	for epoch in range(args.epochs):
 		print(f"epoch {epoch}...")
-		loss = sgd_step(
-			pairs=pairs,
-			params=params,
-			lr=args.lr,
-			log_every=log_every,
-			loss_type=args.loss,
-			K=args.neg_k,
-			neg_dist=neg_dist,
-			rng=rng,
-		)
+		loss = sgd_step(pairs=pairs, model=model, lr=args.lr, log_every=log_every)
 		print(
 			f"epoch={epoch} loss={loss:.4f} pairs={len(pairs)} V={len(vocab)} dim={args.dim}"
 		)

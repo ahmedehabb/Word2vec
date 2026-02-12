@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
+import matplotlib.pyplot as plt
 from datasets import load_dataset
 
 from validations import download_analogies, load_analogies, analogy_accuracy
@@ -211,8 +212,6 @@ def make_unigram_distribution(freqs: np.ndarray, power: float = 0.75) -> np.ndar
 	return adjusted / adjusted.sum()
 
 
-
-
 def sample_negative_indices(
 	vocab_size: int, dist: np.ndarray, K: int, rng: np.random.Generator, exclude: set
 ) -> List[int]:
@@ -226,17 +225,20 @@ def sample_negative_indices(
 	return negatives
 
 
-"""Model-specific forward/backward live in the model classes below."""
-
-
 def sgd_step(
 	pairs: List[Tuple[int, int]],
 	model: Word2VecModel,
 	lr: float,
 	log_every: int | None = None,
-) -> float:
-	"""One SGD sweep using the provided model."""
+) -> Tuple[float, List[float]]:
+	"""One SGD sweep using the provided model.
+	
+	Returns:
+		(avg_loss, step_losses): Average loss for epoch and list of losses at each step
+	"""
 	total_loss = 0.0
+	step_losses: List[float] = []
+	
 	for idx, (center_idx, outside_idx) in enumerate(pairs, start=1):
 		loss, cache = model.forward(center_idx, outside_idx)
 		grad_center, grad_context = model.backward(cache)
@@ -244,13 +246,17 @@ def sgd_step(
 		model.params.center -= lr * grad_center
 		model.params.context -= lr * grad_context
 		total_loss += loss
+		
+		# Track step-level loss
 		if log_every and idx % log_every == 0:
 			avg_loss = total_loss / idx
+			step_losses.append(avg_loss)
 			print(
 				f"  progress: {idx}/{len(pairs)} ({idx/len(pairs):.1%}), "
 				f"avg_loss={avg_loss:.4f}, last_loss={loss:.4f}"
 			)
-	return total_loss / max(1, len(pairs))
+	
+	return total_loss / max(1, len(pairs)), step_losses
 
 
 if __name__ == "__main__":
@@ -261,12 +267,13 @@ if __name__ == "__main__":
 	parser.add_argument("--max_tokens", type=int, default=200_000)
 	parser.add_argument("--vocab_size", type=int, default=5_000)
 	parser.add_argument("--dim", type=int, default=100)
-	parser.add_argument("--window", type=int, default=2)
+	parser.add_argument("--window", type=int, default=4)
 	parser.add_argument("--epochs", type=int, default=3)
 	parser.add_argument("--lr", type=float, default=0.025)
 	parser.add_argument("--loss", choices=["softmax", "neg"], default="softmax")
 	parser.add_argument("--neg_k", type=int, default=5, help="number of negatives per pair")
 	parser.add_argument("--eval_analogies", action="store_true", help="evaluate Google analogies each epoch")
+	parser.add_argument("--plot_loss", action="store_true", help="plot and save loss curves")
 	args = parser.parse_args()
 
 	if args.mode == "toy":
@@ -292,9 +299,15 @@ if __name__ == "__main__":
 		assert neg_dist is not None
 		model = NegSamplingModel(params=params, K=args.neg_k, neg_dist=neg_dist, rng=rng)
 
+	# Track losses across all epochs
+	all_step_losses: List[float] = []
+	epoch_losses: List[float] = []
+
 	for epoch in range(args.epochs):
 		print(f"epoch {epoch}...")
-		loss = sgd_step(pairs=pairs, model=model, lr=args.lr, log_every=log_every)
+		loss, step_losses = sgd_step(pairs=pairs, model=model, lr=args.lr, log_every=log_every)
+		all_step_losses.extend(step_losses)
+		epoch_losses.append(loss)
 		print(
 			f"epoch={epoch} loss={loss:.4f} pairs={len(pairs)} V={len(vocab)} dim={args.dim}"
 		)
@@ -310,3 +323,33 @@ if __name__ == "__main__":
 			print(
 				f"analogies accuracy: {acc_items}; evaluated={counts['evaluated']} skipped={counts['skipped']}"
 			)
+
+	# Plot loss curves if requested
+	if args.plot_loss and all_step_losses:
+		print("\nGenerating loss plots...")
+		fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+		
+		# Plot 1: Step-level losses
+		axes[0].plot(all_step_losses, alpha=0.7, linewidth=1)
+		axes[0].set_xlabel('Training Steps (sampled)', fontsize=12)
+		axes[0].set_ylabel('Average Loss', fontsize=12)
+		axes[0].set_title('Training Loss Over Steps', fontsize=14, fontweight='bold')
+		axes[0].grid(True, alpha=0.3)
+		
+		# Plot 2: Epoch-level losses
+		axes[1].plot(range(1, len(epoch_losses) + 1), epoch_losses, marker='o', linewidth=2, markersize=8)
+		axes[1].set_xlabel('Epoch', fontsize=12)
+		axes[1].set_ylabel('Average Loss', fontsize=12)
+		axes[1].set_title('Training Loss Per Epoch', fontsize=14, fontweight='bold')
+		axes[1].grid(True, alpha=0.3)
+		axes[1].set_xticks(range(1, len(epoch_losses) + 1))
+		
+		plt.suptitle(f'Word2Vec Training (dim={args.dim}, vocab={len(vocab):,}, loss={args.loss})', 
+					 fontsize=16, fontweight='bold')
+		plt.tight_layout()
+		
+		# Save plot
+		plot_filename = f"loss_plot_dim{args.dim}_vocab{len(vocab)}_epochs{args.epochs}_{args.loss}.png"
+		plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+		print(f"✓ Loss plot saved to: {plot_filename}")
+		plt.close()

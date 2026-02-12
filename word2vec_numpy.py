@@ -26,6 +26,11 @@ def softmax(x: np.ndarray) -> np.ndarray:
 	return exps / np.sum(exps)
 
 
+def sigmoid(x: np.ndarray) -> np.ndarray:
+	"""Numerically stable sigmoid."""
+	return 1.0 / (1.0 + np.exp(-x))
+
+
 @dataclass
 class Vocab:
 	tokens: List[str]
@@ -70,13 +75,15 @@ def load_text8_tokens(max_tokens: int | None = None) -> List[str]:
 	return tokens
 
 
-def build_vocab_from_tokens(tokens: List[str], max_size: int) -> Vocab:
+def build_vocab_from_tokens(tokens: List[str], max_size: int) -> Tuple[Vocab, np.ndarray]:
 	counts = {}
 	for t in tokens:
 		counts[t] = counts.get(t, 0) + 1
 	sorted_tokens = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-	keep = [t for t, _ in sorted_tokens[:max_size]]
-	return Vocab(tokens=keep)
+	keep_items = sorted_tokens[:max_size]
+	keep_tokens = [t for t, _ in keep_items]
+	keep_freqs = np.array([f for _, f in keep_items], dtype=np.float64)
+	return Vocab(tokens=keep_tokens), keep_freqs
 
 
 def generate_pairs(tokens: List[str], vocab: Vocab, window: int) -> List[Tuple[int, int]]:
@@ -96,6 +103,25 @@ def generate_pairs(tokens: List[str], vocab: Vocab, window: int) -> List[Tuple[i
 				continue
 			pairs.append((center_idx, lookup[ctx_tok]))
 	return pairs
+
+
+def make_unigram_distribution(freqs: np.ndarray, power: float = 0.75) -> np.ndarray:
+	"""Unigram distribution with exponent, normalized to 1."""
+	adjusted = freqs**power
+	return adjusted / adjusted.sum()
+
+
+def sample_negative_indices(
+	vocab_size: int, dist: np.ndarray, K: int, rng: np.random.Generator, exclude: set
+) -> List[int]:
+	"""Sample K negatives, avoiding excluded indices."""
+	negatives: List[int] = []
+	while len(negatives) < K:
+		candidate = rng.choice(vocab_size, p=dist)
+		if candidate in exclude:
+			continue
+		negatives.append(int(candidate))
+	return negatives
 
 
 def forward_softmax(
@@ -161,15 +187,73 @@ def naive_softmax_loss_and_grads(
 	return loss, grad_center, grad_context
 
 
+def neg_sampling_loss_and_grads(
+	center_idx: int,
+	out_idx: int,
+	neg_indices: List[int],
+	params: Parameters,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+	"""Negative sampling loss/gradients for one center/out pair and K negatives."""
+	v_c = params.center[center_idx]
+
+	# Positive term
+	pos_score = params.context[out_idx] @ v_c
+	pos_sig = sigmoid(pos_score)
+	pos_loss = -np.log(pos_sig + 1e-12)
+
+	# Negative terms
+	neg_vectors = params.context[neg_indices]
+	neg_scores = neg_vectors @ v_c
+	neg_sig = sigmoid(-neg_scores)
+	neg_loss = -np.sum(np.log(neg_sig + 1e-12))
+
+	loss = pos_loss + neg_loss
+
+	grad_center_vec = (pos_sig - 1.0) * params.context[out_idx]
+	grad_center_vec += np.sum(sigmoid(neg_scores)[:, None] * neg_vectors, axis=0)
+
+	grad_center = np.zeros_like(params.center)
+	grad_center[center_idx] = grad_center_vec
+
+	grad_context = np.zeros_like(params.context)
+	grad_context[out_idx] = (pos_sig - 1.0) * v_c
+	grad_context[neg_indices] += sigmoid(neg_scores)[:, None] * v_c[None, :]
+
+	return loss, grad_center, grad_context
+
+
 def sgd_step(
-	pairs: List[Tuple[int, int]], params: Parameters, lr: float, log_every: int | None = None
+	pairs: List[Tuple[int, int]],
+	params: Parameters,
+	lr: float,
+	log_every: int | None = None,
+	loss_type: str = "softmax",
+	K: int = 5,
+	neg_dist: np.ndarray | None = None,
+	rng: np.random.Generator | None = None,
 ) -> float:
-	"""One SGD sweep """
+	"""One SGD sweep with optional negative sampling and progress logging."""
 	total_loss = 0.0
 	for idx, (center_idx, outside_idx) in enumerate(pairs, start=1):
-		loss, grad_center, grad_context = naive_softmax_loss_and_grads(
-			center_idx, outside_idx, params
-		)
+		if loss_type == "softmax":
+			loss, grad_center, grad_context = naive_softmax_loss_and_grads(
+				center_idx, outside_idx, params
+			)
+		elif loss_type == "neg":
+			assert neg_dist is not None and rng is not None
+			neg_indices = sample_negative_indices(
+				vocab_size=params.context.shape[0],
+				dist=neg_dist,
+				K=K,
+				rng=rng,
+				exclude={outside_idx, center_idx},
+			)
+			loss, grad_center, grad_context = neg_sampling_loss_and_grads(
+				center_idx, outside_idx, neg_indices, params
+			)
+		else:
+			raise ValueError(f"unknown loss_type {loss_type}")
+
 		params.center -= lr * grad_center
 		params.context -= lr * grad_context
 		total_loss += loss
@@ -193,6 +277,8 @@ if __name__ == "__main__":
 	parser.add_argument("--window", type=int, default=2)
 	parser.add_argument("--epochs", type=int, default=3)
 	parser.add_argument("--lr", type=float, default=0.025)
+	parser.add_argument("--loss", choices=["softmax", "neg"], default="softmax")
+	parser.add_argument("--neg_k", type=int, default=5, help="number of negatives per pair")
 	args = parser.parse_args()
 
 	if args.mode == "toy":
@@ -200,18 +286,30 @@ if __name__ == "__main__":
 		tokens = corpus
 		window = 1
 		vocab = Vocab(tokens=sorted(set(tokens)))
+		freqs = np.ones(len(vocab), dtype=np.float64)
 	else:
 		tokens = load_text8_tokens(max_tokens=args.max_tokens)
 		window = args.window
-		vocab = build_vocab_from_tokens(tokens, max_size=args.vocab_size)
+		vocab, freqs = build_vocab_from_tokens(tokens, max_size=args.vocab_size)
 
 	pairs = generate_pairs(tokens, vocab, window=window)
 	params = init_params(vocab_size=len(vocab), dim=args.dim)
 	log_every = max(1, len(pairs) // 10)
+	rng = np.random.default_rng(123)
+	neg_dist = make_unigram_distribution(freqs) if args.loss == "neg" else None
 
 	for epoch in range(args.epochs):
 		print(f"epoch {epoch}...")
-		loss = sgd_step(pairs=pairs, params=params, lr=args.lr, log_every=log_every)
+		loss = sgd_step(
+			pairs=pairs,
+			params=params,
+			lr=args.lr,
+			log_every=log_every,
+			loss_type=args.loss,
+			K=args.neg_k,
+			neg_dist=neg_dist,
+			rng=rng,
+		)
 		print(
 			f"epoch={epoch} loss={loss:.4f} pairs={len(pairs)} V={len(vocab)} dim={args.dim}"
 		)

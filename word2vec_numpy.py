@@ -18,6 +18,8 @@ from typing import List, Tuple
 import numpy as np
 from datasets import load_dataset
 
+from validations import download_analogies, load_analogies, analogy_accuracy
+
 
 def softmax(x: np.ndarray) -> np.ndarray:
 	"""Numerically stable softmax over the last axis."""
@@ -173,6 +175,7 @@ def load_text8_tokens(max_tokens: int | None = None) -> List[str]:
 
 
 def build_vocab_from_tokens(tokens: List[str], max_size: int) -> Tuple[Vocab, np.ndarray]:
+	"""Keep the top max_size most frequent tokens (same cutoff idea as the paper)."""
 	counts = {}
 	for t in tokens:
 		counts[t] = counts.get(t, 0) + 1
@@ -206,6 +209,8 @@ def make_unigram_distribution(freqs: np.ndarray, power: float = 0.75) -> np.ndar
 	"""Unigram distribution with exponent, normalized to 1."""
 	adjusted = freqs**power
 	return adjusted / adjusted.sum()
+
+
 
 
 def sample_negative_indices(
@@ -261,6 +266,7 @@ if __name__ == "__main__":
 	parser.add_argument("--lr", type=float, default=0.025)
 	parser.add_argument("--loss", choices=["softmax", "neg"], default="softmax")
 	parser.add_argument("--neg_k", type=int, default=5, help="number of negatives per pair")
+	parser.add_argument("--eval_analogies", action="store_true", help="evaluate Google analogies each epoch")
 	args = parser.parse_args()
 
 	if args.mode == "toy":
@@ -293,4 +299,14 @@ if __name__ == "__main__":
 			f"epoch={epoch} loss={loss:.4f} pairs={len(pairs)} V={len(vocab)} dim={args.dim}"
 		)
 
-	print("center embeddings shape", params.center.shape)
+		if args.eval_analogies:
+			analogies_path = download_analogies()
+			questions = load_analogies(analogies_path)
+			emb = model.params.center
+			acc, counts = analogy_accuracy(vocab.token_to_idx, emb, questions)
+			acc_items = ", ".join(
+				f"{k}: {v*100:.2f}%" for k, v in sorted(acc.items())
+			)
+			print(
+				f"analogies accuracy: {acc_items}; evaluated={counts['evaluated']} skipped={counts['skipped']}"
+			)

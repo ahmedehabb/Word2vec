@@ -13,9 +13,10 @@ derivation, even though it is inefficient for large vocabularies.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
+from datasets import load_dataset
 
 
 def softmax(x: np.ndarray) -> np.ndarray:
@@ -52,6 +53,49 @@ def init_params(vocab_size: int, dim: int, seed: int = 42) -> Parameters:
 	center = rng.uniform(-bound, bound, size=(vocab_size, dim))
 	context = rng.uniform(-bound, bound, size=(vocab_size, dim))
 	return Parameters(center=center, context=context)
+
+
+def load_text8_tokens(max_tokens: int | None = None) -> List[str]:
+	"""Load text8 tokens via Hugging Face datasets (afmck/text8)."""
+
+	ds = load_dataset("afmck/text8", split="train")
+	texts = ds["text"] if "text" in ds.column_names else []
+	if not texts:
+		raise ValueError("text8 dataset missing 'text' column")
+
+	text = " ".join(texts)
+	tokens = text.split()
+	if max_tokens is not None:
+		tokens = tokens[:max_tokens]
+	return tokens
+
+
+def build_vocab_from_tokens(tokens: List[str], max_size: int) -> Vocab:
+	counts = {}
+	for t in tokens:
+		counts[t] = counts.get(t, 0) + 1
+	sorted_tokens = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+	keep = [t for t, _ in sorted_tokens[:max_size]]
+	return Vocab(tokens=keep)
+
+
+def generate_pairs(tokens: List[str], vocab: Vocab, window: int) -> List[Tuple[int, int]]:
+	pairs: List[Tuple[int, int]] = []
+	lookup = vocab.token_to_idx
+	for i, tok in enumerate(tokens):
+		if tok not in lookup:
+			continue
+		center_idx = lookup[tok]
+		start = max(0, i - window)
+		end = min(len(tokens), i + window + 1)
+		for j in range(start, end):
+			if i == j:
+				continue
+			ctx_tok = tokens[j]
+			if ctx_tok not in lookup:
+				continue
+			pairs.append((center_idx, lookup[ctx_tok]))
+	return pairs
 
 
 def forward_softmax(
@@ -118,45 +162,58 @@ def naive_softmax_loss_and_grads(
 
 
 def sgd_step(
-	pairs: List[Tuple[int, int]], params: Parameters, lr: float
+	pairs: List[Tuple[int, int]], params: Parameters, lr: float, log_every: int | None = None
 ) -> float:
-	"""One SGD sweep over provided (center_idx, outside_idx) pairs."""
+	"""One SGD sweep """
 	total_loss = 0.0
-	for center_idx, outside_idx in pairs:
+	for idx, (center_idx, outside_idx) in enumerate(pairs, start=1):
 		loss, grad_center, grad_context = naive_softmax_loss_and_grads(
 			center_idx, outside_idx, params
 		)
 		params.center -= lr * grad_center
 		params.context -= lr * grad_context
 		total_loss += loss
+		if log_every and idx % log_every == 0:
+			avg_loss = total_loss / idx
+			print(
+				f"  progress: {idx}/{len(pairs)} ({idx/len(pairs):.1%}), "
+				f"avg_loss={avg_loss:.4f}, last_loss={loss:.4f}"
+			)
 	return total_loss / max(1, len(pairs))
 
 
-def demo() -> None:
-	"""Small sanity check on a toy corpus."""
-	corpus = "king queen man woman king woman".split()
-	vocab = Vocab(tokens=sorted(set(corpus)))
-	pairs: List[Tuple[int, int]] = []
+if __name__ == "__main__":
+	import argparse
 
-	window = 1
-	for i, token in enumerate(corpus):
-		center_idx = vocab.idx(token)
-		for j in range(max(0, i - window), min(len(corpus), i + window + 1)):
-			if i == j:
-				continue
-			pairs.append((center_idx, vocab.idx(corpus[j])))
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--mode", choices=["toy", "text8"], default="toy")
+	parser.add_argument("--max_tokens", type=int, default=200_000)
+	parser.add_argument("--vocab_size", type=int, default=5_000)
+	parser.add_argument("--dim", type=int, default=100)
+	parser.add_argument("--window", type=int, default=2)
+	parser.add_argument("--epochs", type=int, default=3)
+	parser.add_argument("--lr", type=float, default=0.025)
+	args = parser.parse_args()
 
-	params = init_params(vocab_size=len(vocab), dim=8)
-	lr = 0.1
+	if args.mode == "toy":
+		corpus = "king queen man woman king woman".split()
+		tokens = corpus
+		window = 1
+		vocab = Vocab(tokens=sorted(set(tokens)))
+	else:
+		tokens = load_text8_tokens(max_tokens=args.max_tokens)
+		window = args.window
+		vocab = build_vocab_from_tokens(tokens, max_size=args.vocab_size)
 
-	# Simple training loop for demonstration; not optimized.
-	for epoch in range(100):
-		# Re-create generator because we consume pairs to count size in sgd_step.
-		loss = sgd_step(pairs=list(pairs), params=params, lr=lr)
-		print(f"epoch={epoch} loss={loss:.4f}")
+	pairs = generate_pairs(tokens, vocab, window=window)
+	params = init_params(vocab_size=len(vocab), dim=args.dim)
+	log_every = max(1, len(pairs) // 10)
+
+	for epoch in range(args.epochs):
+		print(f"epoch {epoch}...")
+		loss = sgd_step(pairs=pairs, params=params, lr=args.lr, log_every=log_every)
+		print(
+			f"epoch={epoch} loss={loss:.4f} pairs={len(pairs)} V={len(vocab)} dim={args.dim}"
+		)
 
 	print("center embeddings shape", params.center.shape)
-
-
-if __name__ == "__main__":
-	demo()

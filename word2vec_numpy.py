@@ -54,6 +54,47 @@ def init_params(vocab_size: int, dim: int, seed: int = 42) -> Parameters:
 	return Parameters(center=center, context=context)
 
 
+def forward_softmax(
+	center_idx: int, outside_idx: int, params: Parameters
+) -> Tuple[float, np.ndarray, np.ndarray]:
+	"""
+	Forward pass: compute softmax probs and loss for a (center, context) pair.
+
+	Returns loss, probabilities over vocab, and the center vector snapshot v_c.
+	"""
+
+	v_c = params.center[center_idx]  # v_c
+	scores = params.context @ v_c  # u_w^T v_c for all w
+	probs = softmax(scores)  # P(w|c)
+	loss = -np.log(probs[outside_idx])
+	return loss, probs, v_c
+
+
+def backward_softmax(
+	probs: np.ndarray,
+	center_idx: int,
+	outside_idx: int,
+	params: Parameters,
+	v_c: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+	"""
+	Backward pass: compute gradients given forward outputs.
+
+	Returns grad_center (shape (V, d), only center row nonzero) and
+	grad_context (shape (V, d), dense across vocab).
+	"""
+
+	grad_context = probs[:, None] * v_c[None, :]  # P(w|c) v_c
+	grad_context[outside_idx] -= v_c  # (P(o|c) - 1) v_c at the true word
+
+	expected_context = probs @ params.context  # sum_w P(w|c) u_w
+	grad_v_c = expected_context - params.context[outside_idx]
+
+	grad_center = np.zeros_like(params.center)
+	grad_center[center_idx] = grad_v_c
+	return grad_center, grad_context
+
+
 def naive_softmax_loss_and_grads(
 	center_idx: int, outside_idx: int, params: Parameters
 ) -> Tuple[float, np.ndarray, np.ndarray]:
@@ -65,24 +106,14 @@ def naive_softmax_loss_and_grads(
 	(V, d) and is dense because every u_w participates in the denominator.
 	"""
 
-	v_c = params.center[center_idx]  # v_c
-	scores = params.context @ v_c  # u_w^T v_c for all w
-	probs = softmax(scores)  # P(w|c)
-
-	loss = -np.log(probs[outside_idx])
-
-	# Gradient for context matrix U (u_w).
-	grad_context = probs[:, None] * v_c[None, :]  # P(w|c) v_c
-	grad_context[outside_idx] -= v_c  # (P(o|c) - 1) v_c at the true word
-
-	# Gradient for center vector v_c.
-	expected_context = probs @ params.context  # sum_w P(w|c) u_w
-	grad_v_c = expected_context - params.context[outside_idx]
-
-	# Scatter grad_v_c into the full center matrix shape (only one row nonzero).
-	grad_center = np.zeros_like(params.center)
-	grad_center[center_idx] = grad_v_c
-
+	loss, probs, v_c = forward_softmax(center_idx, outside_idx, params)
+	grad_center, grad_context = backward_softmax(
+		probs=probs,
+		center_idx=center_idx,
+		outside_idx=outside_idx,
+		params=params,
+		v_c=v_c,
+	)
 	return loss, grad_center, grad_context
 
 
